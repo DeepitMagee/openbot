@@ -842,6 +842,23 @@ a refused `turn/start`, and a provider that fails to start do not fail over. A m
 most once for each model that failed it, so a move that cannot happen shows the error on the next
 failure; the check for a ready backup runs again when the turn ends.
 
+### Usage read pacing
+
+Each desktop window, web tab and phone polls the plan usage every five minutes, and each poll reaches
+the host. A usage endpoint allows few requests an hour for each login: Claude's is shared with Claude
+Code and answers HTTP 429 for an hour or more when a client asks too often. So `UsageReadGate`
+(`src/backend/agent/usage-read-gate.ts`) paces the reads of each provider's own sign-in in
+`ProviderRuntime.usage`, and of each account after the first in `ProviderAccounts.usage`. One read runs
+at a time; a request that comes during it waits and takes its reading. A reading answers for four
+minutes, a little less than the poll, so one view still gets a new reading at each poll. After a failed
+read, the next one waits 5 minutes, then 10, 20 and 40, up to an hour, and the last reading stays on the
+rail. A reading whose window has reset is read again before the four minutes end, but not during the
+wait after a failure. Another read of the provider's own sign-in, such as the one after a usage limit or
+when Codex starts, replaces the kept reading. A credential change, another login, a new key or a removed
+account drops the gate, so the next poll reads at once. The thresholds follow t3code (one refresh in
+five minutes for each host), CodexBar and openusage (`Retry-After`, else 5 minutes, doubling up to an
+hour). `scripts/usage-read-pacing-e2e.ts` checks them with a fake Codex.
+
 ### Usage reset credits
 
 Codex can give an account usage reset credits: one restores the spent usage limits of the account at
@@ -849,8 +866,8 @@ once (issue #2859). `account/rateLimits/read` counts them in `rateLimitResetCred
 and `account/rateLimitResetCredit/consume` spends one; both are stable Codex app-server methods since
 0.156.0. `ProviderRuntime.#refreshUsage` keeps the count of each client with its usage reading.
 `usageResets` reads the provider's own sign-in again while its process runs, and keeps the last count
-while it is released; an account after the first uses the reading that the dock keeps for five
-minutes. An account whose reading has no count is left out. `resetUsage` sends the consume with a new
+while it is released; an account after the first uses the reading that the dock keeps (see
+[Usage read pacing](#usage-read-pacing)). An account whose reading has no count is left out. `resetUsage` sends the consume with a new
 `idempotencyKey` for each reset the user asks for, through the running client, an agent's process or a
 short one in the account's folder. Then it reads the account's usage again and sends `usage-changed`.
 After the answer `reset`, or `nothingToReset` (no limit of the account is spent), `AgentService` calls
