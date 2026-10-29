@@ -892,6 +892,7 @@ const openbotApi: OpenBotDesktopApi = {
     getState: decodeLicenseState,
     openCheckout: decodeVoid,
     setUsers: decodeLicenseState,
+    changePlan: decodeLicenseState,
     setRenewal: decodeLicenseState,
   }),
   hostedServers: bridgeGroup(IPC_ENDPOINTS.hostedServers, {
