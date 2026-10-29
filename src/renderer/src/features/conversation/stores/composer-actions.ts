@@ -14,6 +14,7 @@ import {
 } from "@openbot/contracts/ipc";
 import { TEAM_MESSAGE_CLIENT_ID_CAPABILITY } from "@openbot/contracts/team-protocol/current";
 import { isQueueEditRejected, TEAM_QUEUE_EDIT_CAPABILITY } from "@openbot/contracts/team-protocol/queue-edit-v1";
+import type { QuestionPromptComposerAnswer } from "@openbot/ui/components/QuestionPromptBubble";
 import {
   type ComposerPasteResult,
   type ComposerSelection,
@@ -21,7 +22,7 @@ import {
 } from "@openbot/ui/features/conversation/ComposerEditor";
 import { currentText } from "@openbot/ui/text";
 import { playActionSound } from "../../../action-sounds";
-import { claimDictatedSend } from "../../speech/speech-replies";
+import { claimDictatedSend, forgetDictatedMessage } from "../../speech/speech-replies";
 import { rememberAttachmentKinds } from "../attachment-analytics";
 import { type PastedComposerCopy, rememberComposerFile } from "../composer-clipboard";
 import { copyComposerDraft, EMPTY_DRAFT, QUEUE_EDIT_STORAGE_KEY, type StoredQueueEdit } from "../composer-draft";
@@ -104,6 +105,8 @@ export interface ComposerActionsDeps {
   attachmentPicker: () => HTMLInputElement | undefined;
   /** False in a chat window (#2964): the stored queue edit is one slot, and the main window owns it. */
   persistQueueEdit: boolean;
+  /** The open question form of this conversation, which takes the composer text as its answer. */
+  promptComposerAnswer: () => QuestionPromptComposerAnswer | undefined;
 }
 
 /**
@@ -679,6 +682,28 @@ export function createComposerActions(deps: ComposerActionsDeps) {
     );
   }
 
+  /**
+   * While the agent asks a question, the composer text answers it and does not steer the turn. Files,
+   * a reply to a message and a queued message edit still go as a message. A channel message is for
+   * the whole channel, so it does not answer one agent.
+   */
+  function promptAnswerFor(
+    draft: ComposerDraft,
+    target: ConversationTarget | undefined,
+  ): QuestionPromptComposerAnswer | undefined {
+    const answer = deps.promptComposerAnswer();
+    const active = deps.currentTarget();
+    if (deps.props.channel || !answer?.available() || !target || !active) return undefined;
+    if (target.agentId !== active.agentId || target.serverId !== active.serverId) return undefined;
+    if (draft.attachments.length > 0 || draft.replyToMessageId) return undefined;
+    return answer;
+  }
+
+  /** Whether a send from the composer now answers the open question. */
+  function composerAnswersPrompt(): boolean {
+    return !deps.currentEditingDeliveryId() && Boolean(promptAnswerFor(deps.currentDraft(), deps.currentTarget()));
+  }
+
   /** `voice` is set when a voice conversation sends the draft. `steer` takes it into the running turn. */
   async function submitMessage(
     draftOverride?: ComposerDraft,
@@ -695,6 +720,21 @@ export function createComposerActions(deps: ComposerActionsDeps) {
     const target = targetOverride ?? (agentId ? { agentId, serverId: deps.props.server?.id ?? "local" } : undefined);
     const draft = copyComposerDraft(draftOverride ?? deps.currentDraft());
     const text = expandComposerMentions(draft.text);
+    const promptAnswer = promptAnswerFor(draft, target);
+    if (promptAnswer && target) {
+      if (deps.submitting() || !promptAnswer.answer(text)) return false;
+      // An answer is not a message, so no spoken reply or voice recording belongs to it.
+      if (claimDictatedSend(target)) forgetDictatedMessage(target);
+      if (voice?.recordingDraftId)
+        void conversationRuntime(deps.props)
+          .agent.discardDraftAttachment(voice.recordingDraftId, LOCAL_SERVER_ID)
+          .catch(() => {});
+      stopTeamTyping();
+      deps.setComposerError(null, target);
+      deps.clearConversationError(target);
+      deps.clearSubmittedDraft(target, submittedSnapshot ?? draft);
+      return true;
+    }
     if (!agentId || !target || deps.submitting() || (!text.trim() && draft.attachments.length === 0)) return false;
     const provider =
       deps.props.agent?.id === agentId
@@ -892,6 +932,7 @@ export function createComposerActions(deps: ComposerActionsDeps) {
     submitMessage,
     submitComposer,
     steerComposer,
+    composerAnswersPrompt,
     sendSelectionInstruction,
     sendCardMessage,
     retryPendingSend,
