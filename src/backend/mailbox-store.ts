@@ -130,7 +130,7 @@ export interface UsageLimitContinuation {
  * The turns that OpenBot added to a delivery because its plan still had open steps. `queued` is set
  * from the end of one turn to the start of the next; the queue then shows the delivery as running.
  */
-export interface PlanContinuationMarker {
+interface PlanContinuationMarker {
   turnIds: string[];
   queued?: true;
 }
