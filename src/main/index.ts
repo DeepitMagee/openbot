@@ -128,11 +128,27 @@ import { setWindowAppearance } from "./window-appearance";
 const logger = createOpenBotLogger("main");
 
 // Electron keeps running after both events: an unhandled rejection only prints a warning, and a
-// monitor leaves the default exception handling in place. These add a redacted log line and a
-// trace span, so a diagnostics export shows that the main process failed and how often.
+// monitor leaves the default exception handling in place, except after `hideExceptionErrorBox`. These
+// add a redacted log line and a trace span, so a diagnostics export shows that the main process failed
+// and how often.
 let crashTrace: TraceFile | null = null;
 process.on("unhandledRejection", (reason) => reportMainProcessFailure("unhandledRejection", reason));
 process.on("uncaughtExceptionMonitor", (error, origin) => reportMainProcessFailure(origin, error));
+
+let exceptionErrorBoxHidden = false;
+
+/**
+ * Electron shows its error box for an uncaught exception only while no other listener handles it.
+ * The box blocks the main thread: on a server nobody can close it, and during a quit it also holds
+ * back the shutdown deadline (#3808). The monitor above still logs the exception.
+ */
+function hideExceptionErrorBox(): void {
+  if (exceptionErrorBoxHidden) return;
+  exceptionErrorBoxHidden = true;
+  process.on("uncaughtException", () => {
+    // Electron's own listener keeps the process running too.
+  });
+}
 
 type ExitReason = "main_window_closed" | "signal" | "session_end" | "quit";
 let exitRecorded = false;
@@ -179,6 +195,7 @@ removeClaudeCodeSessionEnvironment(process.env);
 const hostedServer = takeHostedServerEnvironment(process.env, app.isPackaged, process.platform);
 const hostingDeveloperKey = takeHostingDeveloperKey(process.env, app.isPackaged);
 const serverMode = takeServerModeEnvironment(process.env, app.isPackaged, process.platform);
+if (serverMode || hostedServer) hideExceptionErrorBox();
 const inviteLinkOptions = {
   allowLocalDevelopmentApiUrl: developmentRemoteRole !== null,
   selfHostedApiOrigin: selfHostedApiOrigin(process.env.OPENBOT_AUTH_API_URL),
@@ -502,6 +519,8 @@ function attachWindowsSessionEndHandlers(window: BrowserWindow): void {
     isQuitting = true;
     // Windows can stop the Computer Use driver first, and sends no `before-quit` for a session end.
     quitStarted = true;
+    // An error box would hold back the flushes below until Windows ends the process.
+    hideExceptionErrorBox();
     void runCauseEffect(windows.flushMainWindowBounds()).catch((error) =>
       logger.error("Unable to save the main window position during Windows session end:", toLogValue(error)),
     );
@@ -1465,6 +1484,8 @@ app.on("window-all-closed", () => {
 app.on("before-quit", (event) => {
   // Any other quit is recorded by `prepareForShutdown`.
   if (systemSessionEnding) recordExit("session_end");
+  // A quit after a Windows session-end query does not run `prepareForShutdown`.
+  hideExceptionErrorBox();
   isQuitting = true;
   quitStarted = true;
   if (systemSessionEnding) {
@@ -1519,6 +1540,7 @@ async function prepareForShutdown(): Promise<void> {
   recordExit("quit");
   shutdownStarted = true;
   isQuitting = true;
+  hideExceptionErrorBox();
   forceExitAfterShutdownDeadline();
   if (services) Effect.runFork(services.updater.stop());
   await runCauseEffect(windows.flushMainWindowBounds()).catch((error) =>
