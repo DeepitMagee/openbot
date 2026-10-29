@@ -22,6 +22,7 @@ import { AGENT_BACKUP_MODELS_ROUTES } from "@openbot/contracts/team-protocol/age
 import { AGENT_HOST_SETTINGS_ROUTES } from "@openbot/contracts/team-protocol/agent-host-settings-v1";
 import { AGENT_IMPORT_CAPABILITY } from "@openbot/contracts/team-protocol/agent-import-v1";
 import { AGENT_TASK_LIMIT_ROUTES } from "@openbot/contracts/team-protocol/agent-task-limit-v1";
+import { AGENT_TASKS_CAPABILITY } from "@openbot/contracts/team-protocol/agent-tasks-v1";
 import { BROWSER_PROFILES_CAPABILITY } from "@openbot/contracts/team-protocol/browser-profiles-v1";
 import { CONNECTORS_CAPABILITY } from "@openbot/contracts/team-protocol/connectors-v1";
 import { CONTEXT_RESET_CAPABILITY } from "@openbot/contracts/team-protocol/context-reset-v1";
@@ -123,8 +124,9 @@ import { toAgentMessage } from "../../app-message-projection";
 import { ProviderSignInDialogs } from "../../components/ProviderSignInDialogs";
 import { isGlobalSearchShortcut } from "../../global-search-shortcut";
 import { LayoutProvider, useLayout } from "../../layout";
-import { AgentUsagePanel, RoutineFlowsCanvas, ScheduleView, ServerOnboarding } from "../../lazy-views";
+import { AgentUsagePanel, RoutineFlowsCanvas, ScheduleView, ServerOnboarding, TasksView } from "../../lazy-views";
 import { PlatformProvider } from "../../platform";
+import { deviceSendShortcut } from "../../send-shortcut-preference";
 import { WorkspaceFrame } from "../../WorkspaceFrame";
 import {
   ChannelCreateOverlay,
@@ -223,6 +225,7 @@ import { createWebProviderSettings, openWebDestination } from "./web-provider-ad
 import { webRoutineFlowsHost } from "./web-routine-flows";
 import { webScheduleSource } from "./web-schedule";
 import { createWebServerSettings } from "./web-server-settings";
+import { webTasksSource } from "./web-tasks";
 import { createWebUsagePort } from "./web-usage-port";
 import { webVaultCalls } from "./web-vault";
 
@@ -265,7 +268,7 @@ async function reportedFailure(send: () => Promise<unknown>, options: PromptAnsw
 }
 
 /** The pages of the connected host that cover the conversation. */
-type HostPageView = "usage" | "schedule";
+type HostPageView = "usage" | "schedule" | "tasks";
 
 type WebWorkspaceProps = {
   accountId: string;
@@ -531,7 +534,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   const compact = () => !phone() && layout.leftPanelCompact();
   /** The Marketplace page. As on desktop, opening another page closes it. */
   const [marketplaceOpen, setMarketplaceOpen] = createSignal(false);
-  /** The Usage or Schedule page of the connected host. As on desktop, it follows a host switch. */
+  /** The Usage, Schedule or Tasks page of the connected host. As on desktop, it follows a host switch. */
   const [hostPage, setHostPage] = createSignal<{ view: HostPageView; trigger: HTMLElement | null } | null>(null);
   /** Only the connected host answers, so another host is connected first, as for its settings. */
   async function openHostPage(serverId: string, view: HostPageView, trigger: HTMLElement | null) {
@@ -783,6 +786,24 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   });
   /** Whether a page other than the agents covers the conversation. A message there is not seen. */
   const pageCovered = () => page() !== "agents";
+  /**
+   * As on desktop: the Tasks page shows in the middle pane, and wins over the other panes. The agent list
+   * is hidden each time the page opens, until the user shows it. A row of the list closes the page, as
+   * each row calls `showAgents`.
+   */
+  const tasksOpen = () => page() === "tasks";
+  const [tasksAgentsOpen, setTasksAgentsOpen] = createSignal(false);
+  createEffect(page, (next) => {
+    if (next !== "tasks") setTasksAgentsOpen(false);
+  });
+  /** The list stays while a connection screen covers the page: the screen does not span the sidebar. */
+  const tasksAgentsHidden = () =>
+    tasksOpen() &&
+    !tasksAgentsOpen() &&
+    workspace.state.status === "online" &&
+    !workspace.state.panelsFailed &&
+    !hostOffline() &&
+    !blockedServer();
   /** Shows the agents and closes the other pages. */
   function showAgents() {
     setAccountSettingsOpen(false);
@@ -816,6 +837,15 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
     return mounts;
   }
   const scheduleSource = webScheduleSource(workspace, hostRequest);
+  const tasksSource = webTasksSource(workspace, hostRequest);
+  const tasksSupported = () => workspace.state.capabilities.includes(AGENT_TASKS_CAPABILITY);
+  // The Tasks page follows a host switch. An older host has no task routes and no Tasks button.
+  createEffect(
+    () => tasksOpen() && workspace.state.status === "online" && !tasksSupported(),
+    (unsupported) => {
+      if (unsupported) setHostPage(null);
+    },
+  );
   const marketplaceCalls = createWebMarketplaceCalls(props.accountFetch, hostRequest);
   // The host's connectors, for an owner or admin. The web client has no computer of its own.
   const connectorTarget = createMemo(() => remoteAdminServer(server(), CONNECTORS_CAPABILITY));
@@ -1184,7 +1214,8 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
   const firstAgent = () => workspace.state.agentsLoaded && workspace.profiles().length === 0 && createSupported();
   /** An open channel still takes the pane, as a channel closes the desktop form. */
   const agentFormOpen = () => creating() || (firstAgent() && !channelOpen());
-  const agentChatOpen = () => !agentFormOpen() && !channelOpen() && !noHost() && !hostOffline() && !routinesView();
+  const agentChatOpen = () =>
+    !tasksOpen() && !agentFormOpen() && !channelOpen() && !noHost() && !hostOffline() && !routinesView();
   /**
    * The provider that a server's provider step chose, by server. In memory only, as on desktop: the
    * saved setup choice is of the desktop computer, not of the server.
@@ -1637,6 +1668,14 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
             usageRows={usageRows()}
             onAgents={() => showSidebarView("agents")}
             onRoutines={routinesSupported() ? () => showSidebarView("routines") : undefined}
+            onTasks={
+              tasksSupported()
+                ? (button) => {
+                    const id = server()?.id;
+                    if (id) void openHostPage(id, "tasks", button);
+                  }
+                : undefined
+            }
             onSchedule={(button) => {
               const id = server()?.id;
               if (id) void openHostPage(id, "schedule", button);
@@ -1724,6 +1763,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
               })
             }
             windowPage={page()}
+            sidebarHidden={tasksAgentsHidden()}
             page={
               <Show
                 when={page() === "usage" || page() === "schedule" ? server() : undefined}
@@ -1840,7 +1880,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                   deletedChannels={
                     channelsListed() ? channels.state.channels.filter((channel) => channel.archived) : []
                   }
-                  activeChannelId={channels.state.selectedId}
+                  activeChannelId={tasksOpen() ? null : channels.state.selectedId}
                   onSelectChannel={openChannel}
                   onEditChannel={(id) => openChannel(id, true)}
                   onDeleteChannel={channels.deletionSupported() ? channels.remove : undefined}
@@ -1879,7 +1919,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                     ...serverActionCallbacks,
                   }}
                   agents={workspace.profiles()}
-                  activeAgentId={channelOpen() ? "" : (workspace.state.selectedId ?? "")}
+                  activeAgentId={tasksOpen() || channelOpen() ? "" : (workspace.state.selectedId ?? "")}
                   people={[]}
                   directThreads={[]}
                   activeDirectMemberId={null}
@@ -2207,7 +2247,54 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
               </>
             }
           >
-            <Show when={serverOnboarding()}>
+            <Show when={tasksOpen() ? server() : undefined}>
+              {(target) => (
+                <Loading>
+                  <TasksView
+                    serverId={target().id}
+                    hostName={target().name}
+                    onBack={closeHostPage}
+                    agentsOpen={!tasksAgentsHidden()}
+                    onToggleAgents={() => setTasksAgentsOpen(tasksAgentsHidden())}
+                    source={tasksSource}
+                    agents={workspace.profiles()}
+                    onOpenLink={(url) => void openWebLink(url)}
+                    // The browser only downloads a file.
+                    onAttachmentAction={(attachment) =>
+                      void runtime.agent
+                        .openAttachment({ attachmentId: attachment.id, action: "download" })
+                        .catch((error) => actionToast.error(text.errorMessage(error, t("attachment.error.download"))))
+                    }
+                    approvals={workspace.state.approvals}
+                    onRespondApproval={async (approval, decision) => {
+                      await workspace.approve({ requestId: approval.requestId, decision });
+                      return true;
+                    }}
+                    onRead={(input, messageId) =>
+                      agentThreads()?.tasks.markTaskRead(input.agentId, input.taskId, messageId)
+                    }
+                    waitsForAnswer={(task) =>
+                      workspace.state.prompts.some(
+                        (prompt) => prompt.agentId === task.agentId && prompt.threadId === task.threadId,
+                      ) ||
+                      workspace.state.takeovers.some(
+                        (request) => request.agentId === task.agentId && request.threadId === task.threadId,
+                      )
+                    }
+                    // The tab is written first, so the chat opens on it. Opening the chat closes the page.
+                    onOpenInChat={(task) => {
+                      agentThreads()?.tabs.open(task.agentId, task.id);
+                      // The Routines view covers the chat.
+                      layout.setSidebarView("agents");
+                      setMobilePane("conversation");
+                      void select(task.agentId);
+                    }}
+                    sendShortcut={deviceSendShortcut()}
+                  />
+                </Loading>
+              )}
+            </Show>
+            <Show when={tasksOpen() ? undefined : serverOnboarding()}>
               {(settings) => (
                 <Loading>
                   <ServerOnboarding
@@ -2233,7 +2320,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 </Loading>
               )}
             </Show>
-            <Show when={agentFormOpen() && !serverOnboarding()}>
+            <Show when={!tasksOpen() && agentFormOpen() && !serverOnboarding()}>
               <WebAgentSettings
                 runtime={workspace.runtime}
                 capabilities={workspace.state.capabilities}
@@ -2254,7 +2341,7 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 }}
               />
             </Show>
-            <Show when={!agentFormOpen() && channelOpen()}>
+            <Show when={!tasksOpen() && !agentFormOpen() && channelOpen()}>
               {/* Keyed by the channel: the view reads its channel once, so another channel opens a new view. */}
               <Show when={channels.state.selectedId} keyed>
                 {(channelId) => {
@@ -2385,7 +2472,9 @@ function WebWorkspaceFrame(props: WebWorkspaceProps) {
                 onRefresh={() => void workspace.run(workspace.refreshHosts)}
               />
             </Show>
-            <Show when={!agentFormOpen() && !channelOpen() && !noHost() && !hostOffline() && routinesView()}>
+            <Show
+              when={!tasksOpen() && !agentFormOpen() && !channelOpen() && !noHost() && !hostOffline() && routinesView()}
+            >
               {/* A host switch starts the canvas again, with that host's webhook relay status. */}
               <Show when={routineFlowsHost ? workspace.state.host?.hostId : undefined} keyed>
                 {(_hostId) => (
