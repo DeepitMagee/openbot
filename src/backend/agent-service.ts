@@ -173,6 +173,7 @@ import {
   startingModel,
 } from "./agent/model-choice";
 import { OpenBotToolRouter } from "./agent/openbot-tool-router";
+import { PlanContinuation } from "./agent/plan-continuation";
 import { ProfileClients } from "./agent/profile-clients";
 import {
   GenerationUsageLimitError,
@@ -470,6 +471,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   readonly #stoppedTurns = new Map<string, string>();
   /** The agents that asked for a new chat with `start_new_chat`. A restart forgets the request. */
   readonly #requestedNewChats = new Set<string>();
+  /** A turn that ends with open plan steps runs again, at most 3 times for one request. */
+  readonly #planContinuation = new PlanContinuation({ limit: 3 });
   #initialized = false;
   #stopping = false;
 
@@ -1250,6 +1253,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       threads: this.#threads,
       memory: this.#memoryHold,
       usageLimits: this.#usageLimits,
+      planContinuation: this.#planContinuation,
       tasks: this.#tasks,
       hooks: {
         emitError: (code, error, agentId) => this.#emitError(code, error, agentId),
@@ -1354,6 +1358,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
       images: this.#images,
       deltas: this.#deltas,
       usageLimits: this.#usageLimits,
+      planContinuation: this.#planContinuation,
       hooks: {
         emitFailure: (failure) => this.emit("failure", failure),
         emit: (event) => this.#emit(event),
@@ -1374,6 +1379,12 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
         closeRoutineSession: (externalThreadId) => this.#threads.closeRoutineThread(externalThreadId),
         conversationTurnEnded: (agentId, sideThreadId, counts, memoryCommitted) =>
           this.#memoryReview.turnEnded(agentId, sideThreadId, counts, memoryCommitted),
+        turnStopped: (agentId, taskId, turnId) =>
+          taskId === null
+            ? this.#stoppedTurns.get(agentId) === turnId || this.#requestedNewChats.has(agentId)
+            : this.#tasks.stoppedTurn(taskId) === turnId,
+        hasOpenWait: (agentId, deliveryIds) =>
+          this.#waits.list(agentId).waits.some((wait) => deliveryIds.includes(wait.requestMessageId)),
         routineAnswered: (agentId, deliveryId, answer) => {
           const agent = this.#store.list().find((item) => item.id === agentId);
           const run = this.#routines.runForDelivery(deliveryId);
@@ -3198,6 +3209,8 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     this: AgentService,
     agentId: string,
   ) {
+    // A new chat ends the automatic plan continuation of the agent's own chat.
+    yield* this.#drain.endPlanContinuation(agentId, null);
     const threadId = yield* lifecycleStep("clear agent context", () => {
       const agent = this.#conversation.requireKnownAgent(agentId);
       const activeTurn =
@@ -3408,9 +3421,10 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   }
 
   deleteAgent(agentId: string): Effect.Effect<void, AgentLifecycleFailed> {
-    return this.#removal
-      .delete(agentId)
-      .pipe(Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "deleteAgent", cause: failure.cause })));
+    return Effect.sync(() => this.#planContinuation.cancel(agentId)).pipe(
+      Effect.andThen(this.#removal.delete(agentId)),
+      Effect.mapError((failure) => new AgentLifecycleFailed({ operation: "deleteAgent", cause: failure.cause })),
+    );
   }
 
   deleteChannel(channelId: string): Effect.Effect<void, AgentLifecycleFailed> {
@@ -3969,6 +3983,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     yield* this.#turn.dispose();
     yield* this.#usageLimits.dispose();
     this.#drain.dispose();
+    this.#planContinuation.dispose();
     this.#browser.clearControls();
     yield* Effect.forEach(clients, (client) => client.stop().pipe(Effect.catch(() => Effect.void)), {
       concurrency: "unbounded",
@@ -4248,6 +4263,7 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
     input: AgentTaskInput,
   ): Effect.fn.Return<void, AgentLifecycleFailed> {
     const task = yield* lifecycleStep("find task", () => this.#tasks.require(input.agentId, input.taskId));
+    yield* this.#drain.endPlanContinuation(task.agentId, task.taskId);
     // A teammate's answer stays in the open thread, so it runs with the other answers to the same request.
     for (const message of this.#mailbox.queuedTaskMessages(task.agentId, task.taskId, { teammateAnswers: false }))
       yield* this.cancelQueuedMessage(task.agentId, message.deliveryId);
@@ -4759,7 +4775,11 @@ export class AgentService extends EventEmitter<AgentServiceEvents> {
   interrupt(agentId: string, turnId: string, executionThreadId?: string): Effect.Effect<void, AgentLifecycleFailed> {
     return Effect.suspend(() => {
       if (!executionThreadId) this.#stoppedTurns.set(agentId, turnId);
-      return this.#interruptTurn(agentId, turnId, executionThreadId);
+      const taskId = executionThreadId ? this.#tasks.taskForThread(executionThreadId) : null;
+      // A Stop also ends the automatic plan continuation of its lane. A channel turn has none.
+      const endContinuation =
+        executionThreadId && taskId === null ? Effect.void : this.#drain.endPlanContinuation(agentId, taskId);
+      return endContinuation.pipe(Effect.andThen(this.#interruptTurn(agentId, turnId, executionThreadId)));
     }).pipe(Effect.asVoid);
   }
 
