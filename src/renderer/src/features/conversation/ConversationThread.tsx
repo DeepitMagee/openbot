@@ -6,9 +6,9 @@ import { Input } from "@openbot/ui";
 import type { AgentMessage } from "@openbot/ui/data";
 import { ChatSearch } from "@openbot/ui/features/conversation/ChatSearch";
 import { contextUsageView } from "@openbot/ui/features/conversation/ContextUsage";
-import { AgentThreadView } from "@openbot/ui/features/conversation/threads/AgentThreadView";
+import { AgentThreadView, type AgentThreadVoice } from "@openbot/ui/features/conversation/threads/AgentThreadView";
 import { useText } from "@openbot/ui/text";
-import { createEffect, createMemo, createProjection, createSignal, Show } from "solid-js";
+import { createEffect, createMemo, createProjection, createSignal, Show, untrack } from "solid-js";
 import { actionToast } from "../../action-toast";
 import { useShowAgentSteps } from "../../agent-steps-preference";
 import { toAgentMessages } from "../../app-message-projection";
@@ -37,6 +37,19 @@ export function ConversationThread() {
     installedSkillsLoadFailed,
     mcpServers,
     threadComposer,
+    threadFocusRequest,
+    threadVoiceLiveText,
+    threadVoiceOwned,
+    startThreadVoiceRecording,
+    stopVoiceRecording,
+    stopVoiceRecordingAndSend,
+    cancelVoiceRecording,
+    voicePhase,
+    voiceLevels,
+    voiceElapsedSeconds,
+    voiceModelProgress,
+    sideQuestionAvailable,
+    openSideQuestion,
     threadSearch,
     threadSearchOpen,
     threadSearchQuery,
@@ -108,6 +121,40 @@ export function ConversationThread() {
     input.value = "";
     input.click();
   };
+  /** As in the agent's own chat: the draft goes to the side question, unless it names files. */
+  const askSideQuestion = () => {
+    if (!sideQuestionAvailable()) return undefined;
+    return () => {
+      const current = draft();
+      const text = current?.attachments.length === 0 ? current.text : "";
+      if (text) threadComposer.setText(threadComposer.openDraftKey(), "");
+      openSideQuestion(text);
+    };
+  };
+  // The editor is new each time a thread opens. A focus request from before is not for it: it would take
+  // the focus from where the user clicked.
+  const shownAt = untrack(threadFocusRequest);
+  const focusRequest = () => {
+    const request = threadFocusRequest();
+    return request > shownAt ? request : undefined;
+  };
+  /** Dictation as in the agent's own chat. The web client has no speech model. */
+  const voice = (): AgentThreadVoice | undefined => {
+    if (props.runtime) return undefined;
+    const owned = threadVoiceOwned();
+    return {
+      phase: owned ? voicePhase() : "idle",
+      blocked: !owned && voicePhase() !== "idle",
+      liveText: threadVoiceLiveText(),
+      levels: voiceLevels(),
+      elapsedSeconds: voiceElapsedSeconds(),
+      modelProgress: voiceModelProgress(),
+      onStart: startThreadVoiceRecording,
+      onCancel: cancelVoiceRecording,
+      onFinish: stopVoiceRecording,
+      onSend: stopVoiceRecordingAndSend,
+    };
+  };
   /** The cards that the thread waits for: its browser takeover, and its question as a form. */
   const attention = () => {
     if (!hasAttention()) return undefined;
@@ -169,6 +216,9 @@ export function ConversationThread() {
                 : attachmentAction(attachment, "open")
             }
             onAttachFiles={current().threads.acceptsFiles ? openPicker : undefined}
+            onSideQuestion={askSideQuestion()}
+            voice={voice()}
+            focusRequest={focusRequest()}
             onSend={(text) => threadComposer.send(current().threads, text)}
             onStop={() => current().threads.onStop()}
             onOpenLink={(url) => void openExternalMessageUrl(url)}
